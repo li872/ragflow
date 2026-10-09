@@ -263,6 +263,33 @@ type failingDeleteDocEngine struct {
 	err error
 }
 
+// recordingDeleteDocEngine records DeleteChunks / DeleteMetadata calls for keep-file deletion tests.
+type recordingDeleteDocEngine struct {
+	fakeChatDocEngine
+	deleteChunkCalls int
+	chunkCondition   map[string]interface{}
+	chunkIndexName   string
+	chunkDatasetID   string
+	deleteMetaCalls  int
+	metaCondition    map[string]interface{}
+	metaTenantID     string
+}
+
+func (e *recordingDeleteDocEngine) DeleteChunks(_ context.Context, condition map[string]interface{}, indexName string, datasetID string) (int64, error) {
+	e.deleteChunkCalls++
+	e.chunkCondition = condition
+	e.chunkIndexName = indexName
+	e.chunkDatasetID = datasetID
+	return 1, nil
+}
+
+func (e *recordingDeleteDocEngine) DeleteMetadata(_ context.Context, condition map[string]interface{}, tenantID string) (int64, error) {
+	e.deleteMetaCalls++
+	e.metaCondition = condition
+	e.metaTenantID = tenantID
+	return 1, nil
+}
+
 type generatedCleanupDocEngine struct {
 	fakeChatDocEngine
 	deleteCalls      int
@@ -838,6 +865,71 @@ func TestRemoveDocumentKeepFilePurgesTaskStateBeforeDeletingDocument(t *testing.
 	}
 	if _, err := svc.documentDAO.GetByID(t.Context(), db, "doc-1"); err != nil {
 		t.Fatalf("document was deleted despite resumable state cleanup failure: %v", err)
+	}
+}
+
+func TestRemoveDocumentKeepFileDeletesEngineChunksAndMetadata(t *testing.T) {
+	db := setupServiceTestDB(t)
+	pushServiceDB(t, db)
+	insertTestKB(t, "kb-1", "tenant-1", 1, 10, 5)
+	insertTestDoc(t, "doc-1", "kb-1", 10, 5)
+
+	engine := &recordingDeleteDocEngine{}
+	svc := testDocumentService(t)
+	svc.docEngine = engine
+	svc.metadataSvc = service.NewMetadataServiceForTest(dao.NewKnowledgebaseDAO(), engine)
+
+	if err := svc.RemoveDocumentKeepFile(t.Context(), "doc-1"); err != nil {
+		t.Fatalf("RemoveDocumentKeepFile failed: %v", err)
+	}
+	if engine.deleteChunkCalls != 1 {
+		t.Fatalf("DeleteChunks calls = %d, want 1", engine.deleteChunkCalls)
+	}
+	if engine.chunkIndexName != "ragflow_tenant-1" || engine.chunkDatasetID != "kb-1" {
+		t.Fatalf("DeleteChunks index=%q dataset=%q, want ragflow_tenant-1 / kb-1", engine.chunkIndexName, engine.chunkDatasetID)
+	}
+	if got, _ := engine.chunkCondition["doc_id"].(string); got != "doc-1" {
+		t.Fatalf("DeleteChunks condition = %#v, want doc_id=doc-1", engine.chunkCondition)
+	}
+	if engine.deleteMetaCalls != 1 {
+		t.Fatalf("DeleteMetadata calls = %d, want 1", engine.deleteMetaCalls)
+	}
+	if engine.metaTenantID != "tenant-1" {
+		t.Fatalf("DeleteMetadata tenant = %q, want tenant-1", engine.metaTenantID)
+	}
+	if gotID, _ := engine.metaCondition["id"].(string); gotID != "doc-1" {
+		t.Fatalf("DeleteMetadata condition = %#v, want id=doc-1", engine.metaCondition)
+	}
+	if gotKB, _ := engine.metaCondition["kb_id"].(string); gotKB != "kb-1" {
+		t.Fatalf("DeleteMetadata condition = %#v, want kb_id=kb-1", engine.metaCondition)
+	}
+	if _, err := svc.documentDAO.GetByID(t.Context(), db, "doc-1"); err == nil {
+		t.Fatal("document row still present after RemoveDocumentKeepFile")
+	}
+	kb, err := svc.kbDAO.GetByID(t.Context(), db, "kb-1")
+	if err != nil {
+		t.Fatalf("reload KB: %v", err)
+	}
+	if kb.DocNum != 0 || kb.ChunkNum != 0 || kb.TokenNum != 0 {
+		t.Fatalf("KB counters = doc:%d chunk:%d token:%d, want zeros", kb.DocNum, kb.ChunkNum, kb.TokenNum)
+	}
+}
+
+func TestRemoveDocumentKeepFileKeepsDocumentWhenChunkDeletionFails(t *testing.T) {
+	db := setupServiceTestDB(t)
+	pushServiceDB(t, db)
+	insertTestKB(t, "kb-1", "tenant-1", 1, 0, 0)
+	insertTestDoc(t, "doc-1", "kb-1", 0, 0)
+
+	deleteErr := errors.New("chunk store unavailable")
+	svc := testDocumentService(t)
+	svc.docEngine = &failingDeleteDocEngine{err: deleteErr}
+
+	if err := svc.RemoveDocumentKeepFile(t.Context(), "doc-1"); !errors.Is(err, deleteErr) {
+		t.Fatalf("RemoveDocumentKeepFile error = %v, want chunk deletion error", err)
+	}
+	if _, err := svc.documentDAO.GetByID(t.Context(), db, "doc-1"); err != nil {
+		t.Fatalf("document was deleted after chunk deletion failure: %v", err)
 	}
 }
 

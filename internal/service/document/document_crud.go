@@ -309,10 +309,6 @@ func (s *DocumentService) RemoveDocumentKeepFile(ctx context.Context, docID stri
 	if err != nil {
 		return err
 	}
-	variants, taskTypes, typeErr := s.documentKnowledgeCompileTypes(ctx, kb.TenantID, kb.ID, docID)
-	if typeErr != nil {
-		return fmt.Errorf("resolve knowledge compile types for document %s: %w", docID, typeErr)
-	}
 	ingestionTask, err := s.ingestionTaskDAO.GetByDocumentID(ctx, dao.DB, docID)
 	if err != nil {
 		return fmt.Errorf("failed to get ingestion task for %s: %w", docID, err)
@@ -331,19 +327,14 @@ func (s *DocumentService) RemoveDocumentKeepFile(ctx context.Context, docID stri
 		}
 		common.Warn(fmt.Sprintf("RemoveDocumentKeepFile: failed to delete tasks for %s: %v", docID, delErr))
 	}
-	if err := s.deleteDocRecordWithCounters(ctx, doc, kb.ID); err != nil {
+	// Same engine cleanup as deleteDocumentFull: chunks, knowledge-compile
+	// deletion events, and metadata. Must run before the MySQL row is removed
+	// because DeleteDocumentAllMetadata looks the document up by ID.
+	if err := s.deleteDocEngineData(ctx, docID, kb.TenantID, doc.KbID); err != nil {
 		return err
 	}
-	if len(variants) == 0 {
-		return nil
-	}
-	// File replacement/deletion uses this path instead of deleteDocumentFull.
-	// Publish the same deletion event so the dataset-level consumer removes the
-	// deleted document's contribution in both paths.
-	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-	defer cancel()
-	if err := knowledge_compile.PublishDeleted(pubCtx, kb.TenantID, kb.ID, docID, variants, taskTypes); err != nil {
-		common.Warn(fmt.Sprintf("RemoveDocumentKeepFile: publish doc_deleted for %s failed: %v", docID, err))
+	if err := s.deleteDocRecordWithCounters(ctx, doc, kb.ID); err != nil {
+		return err
 	}
 	return nil
 }
